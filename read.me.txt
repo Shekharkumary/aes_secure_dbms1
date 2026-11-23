@@ -1,0 +1,371 @@
+"""AES-256-GCM encrypted SQLite database (core module)."""
+import sqlite3
+import time
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import scrypt
+from Crypto.Random import get_random_bytes
+
+FIELDS = ("full_name", "email", "phone", "card_number", "notes")
+NONCE, TAG = 12, 16
+MAX_ATTEMPTS, LOCKOUT_SECONDS = 5, 30
+
+
+class AuthError(Exception):
+    pass
+
+
+class IntegrityError(Exception):
+    pass
+
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """Password -> 256-bit key using scrypt (memory-hard KDF)."""
+    return scrypt(password.encode(), salt, 32, N=2**15, r=8, p=1)
+
+
+def encrypt(key: bytes, text: str, aad: bytes) -> bytes:
+    nonce = get_random_bytes(NONCE)                 # fresh random nonce per value
+    c = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    c.update(aad)
+    ct, tag = c.encrypt_and_digest(text.encode())
+    return nonce + tag + ct
+
+
+def decrypt(key: bytes, blob: bytes, aad: bytes) -> str:
+    nonce, tag, ct = blob[:NONCE], blob[NONCE:NONCE + TAG], blob[NONCE + TAG:]
+    c = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    c.update(aad)
+    try:
+        return c.decrypt_and_verify(ct, tag).decode()
+    except ValueError as e:                          # wrong key or tampered data
+        raise IntegrityError("Decryption failed: wrong key or tampered data") from e
+
+
+class SecureDB:
+    def __init__(self, path="secure.db"):
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.key = None
+        self._fails, self._locked_until = 0, 0.0
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v BLOB)")
+        cols = ", ".join(f"{f} BLOB" for f in FIELDS)
+        self.conn.execute(f"CREATE TABLE IF NOT EXISTS records("
+                          f"id INTEGER PRIMARY KEY AUTOINCREMENT, {cols}, "
+                          f"created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        self.conn.commit()
+
+    # ---------- authentication ----------
+    def is_initialized(self):
+        return self.conn.execute("SELECT 1 FROM meta WHERE k='salt'").fetchone() is not None
+
+    def setup(self, password: str):
+        """First run: create salt and an encrypted verifier used to check passwords."""
+        if self.is_initialized():
+            raise AuthError("Database already initialised")
+        if len(password) < 8:
+            raise AuthError("Password must be at least 8 characters")
+        salt = get_random_bytes(16)
+        key = derive_key(password, salt)
+        self.conn.execute("INSERT INTO meta VALUES('salt', ?)", (salt,))
+        self.conn.execute("INSERT INTO meta VALUES('verifier', ?)",
+                          (encrypt(key, "OK", b"verifier"),))
+        self.conn.commit()
+        self.key = key
+
+    def login(self, password: str):
+        if time.time() < self._locked_until:
+            raise AuthError("Too many failed attempts. Try again later.")
+        salt = self.conn.execute("SELECT v FROM meta WHERE k='salt'").fetchone()[0]
+        ver = self.conn.execute("SELECT v FROM meta WHERE k='verifier'").fetchone()[0]
+        key = derive_key(password, salt)
+        try:
+            decrypt(key, ver, b"verifier")
+        except IntegrityError:
+            self._fails += 1
+            if self._fails >= MAX_ATTEMPTS:
+                self._locked_until, self._fails = time.time() + LOCKOUT_SECONDS, 0
+            raise AuthError("Authentication failed")
+        self._fails, self.key = 0, key
+
+    def logout(self):
+        self.key = None
+
+    def _need_auth(self):
+        if self.key is None:
+            raise AuthError("Not authenticated")
+
+    # ---------- CRUD ----------
+    def _enc_row(self, rec):
+        return [encrypt(self.key, str(rec.get(f, "")), f.encode()) for f in FIELDS]
+
+    def _dec_row(self, row):
+        return {"id": row[0], **{f: decrypt(self.key, row[i + 1], f.encode())
+                                 for i, f in enumerate(FIELDS)}, "created_at": row[-1]}
+
+    def insert(self, rec, commit=True):
+        self._need_auth()
+        q = f"INSERT INTO records({','.join(FIELDS)}) VALUES({','.join('?' * len(FIELDS))})"
+        cur = self.conn.execute(q, self._enc_row(rec))
+        if commit:
+            self.conn.commit()
+        return cur.lastrowid
+
+    def insert_many(self, recs):
+        self._need_auth()
+        q = f"INSERT INTO records({','.join(FIELDS)}) VALUES({','.join('?' * len(FIELDS))})"
+        self.conn.executemany(q, [self._enc_row(r) for r in recs])
+        self.conn.commit()
+
+    def get(self, rid):
+        self._need_auth()
+        row = self.conn.execute("SELECT * FROM records WHERE id=?", (rid,)).fetchone()
+        return self._dec_row(row) if row else None
+
+    def list_all(self):
+        self._need_auth()
+        return [self._dec_row(r) for r in self.conn.execute("SELECT * FROM records")]
+
+    def search(self, term):
+        """Encrypted columns can't be queried by SQL, so search after decryption."""
+        t = term.lower()
+        return [r for r in self.list_all()
+                if any(t in str(v).lower() for k, v in r.items() if k in FIELDS)]
+
+    def update(self, rid, rec):
+        self._need_auth()
+        sets = ",".join(f"{f}=?" for f in FIELDS)
+        cur = self.conn.execute(f"UPDATE records SET {sets} WHERE id=?",
+                                self._enc_row(rec) + [rid])
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete(self, rid):
+        self._need_auth()
+        cur = self.conn.execute("DELETE FROM records WHERE id=?", (rid,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def close(self):
+        self.conn.close()
+
+
+
+
+2
+
+
+"""Optional Tkinter front-end."""
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from secure_db import SecureDB, AuthError, FIELDS
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__(); self.title("AES Secure Database"); self.geometry("820x460")
+        self.db = SecureDB("secure.db")
+        pw = simpledialog.askstring("Login" if self.db.is_initialized() else "Create master password",
+                                    "Master password:", show="*")
+        try:
+            self.db.login(pw or "") if self.db.is_initialized() else self.db.setup(pw or "")
+        except AuthError as e:
+            messagebox.showerror("Error", str(e)); self.destroy(); return
+        self.entries = {}
+        form = ttk.Frame(self); form.pack(fill="x", padx=8, pady=8)
+        for i, f in enumerate(FIELDS):
+            ttk.Label(form, text=f).grid(row=0, column=i)
+            self.entries[f] = ttk.Entry(form, width=15); self.entries[f].grid(row=1, column=i, padx=2)
+        bar = ttk.Frame(self); bar.pack(fill="x", padx=8)
+        for t, cmd in (("Add", self.add), ("Update", self.upd), ("Delete", self.rem),
+                       ("Search", self.find), ("Show all", self.refresh)):
+            ttk.Button(bar, text=t, command=cmd).pack(side="left", padx=2)
+        self.q = ttk.Entry(bar, width=20); self.q.pack(side="left", padx=6)
+        self.tree = ttk.Treeview(self, columns=("id", *FIELDS), show="headings")
+        for c in ("id", *FIELDS): self.tree.heading(c, text=c); self.tree.column(c, width=60 if c == "id" else 130)
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self.pick); self.refresh()
+
+    def data(self): return {f: e.get() for f, e in self.entries.items()}
+    def sel(self):
+        s = self.tree.selection(); return int(self.tree.item(s[0])["values"][0]) if s else None
+    def show(self, rows):
+        self.tree.delete(*self.tree.get_children())
+        for r in rows: self.tree.insert("", "end", values=(r["id"], *[r[f] for f in FIELDS]))
+    def refresh(self): self.show(self.db.list_all())
+    def find(self): self.show(self.db.search(self.q.get()))
+    def add(self): self.db.insert(self.data()); self.refresh()
+    def upd(self):
+        if self.sel(): self.db.update(self.sel(), self.data()); self.refresh()
+    def rem(self):
+        if self.sel() and messagebox.askyesno("Delete", "Delete record?"): self.db.delete(self.sel()); self.refresh()
+    def pick(self, _):
+        s = self.tree.selection()
+        if s:
+            for e, v in zip(self.entries.values(), self.tree.item(s[0])["values"][1:]):
+                e.delete(0, "end"); e.insert(0, v)
+
+
+if __name__ == "__main__":
+    App().mainloop()
+
+
+3
+
+
+"""Security verification: confidentiality, authentication, integrity, injection."""
+import os, shutil, sqlite3, tempfile
+from secure_db import SecureDB, AuthError, IntegrityError, decrypt, derive_key
+
+SECRETS = {"full_name": "Alice Wonderland", "email": "alice@secret-mail.com",
+           "phone": "555-0199-777", "card_number": "4111111111111111",
+           "notes": "TOP-SECRET-NOTE-XYZ"}
+results = []
+
+
+def check(name, cond):
+    results.append(cond); print(f"[{'PASS' if cond else 'FAIL'}] {name}")
+
+
+def raises(exc, fn):
+    try: fn()
+    except exc: return True
+    except Exception: return False
+    return False
+
+
+tmp = tempfile.mkdtemp(); path = os.path.join(tmp, "t.db")
+db = SecureDB(path); db.setup("Correct-Horse-Battery"); rid = db.insert(SECRETS); db.close()
+
+# 1. Plaintext disclosure: scan raw file bytes
+raw = open(path, "rb").read()
+check("No plaintext secrets in raw database file", not any(v.encode() in raw for v in SECRETS.values()))
+
+# 2. Unauthorised access without logging in
+db = SecureDB(path)
+check("Read blocked before authentication", raises(AuthError, lambda: db.get(rid)))
+check("Write blocked before authentication", raises(AuthError, lambda: db.insert(SECRETS)))
+
+# 3. Wrong password
+check("Wrong password rejected", raises(AuthError, lambda: db.login("wrong-password")))
+db.login("Correct-Horse-Battery")
+check("Correct password decrypts original data", db.get(rid)["card_number"] == SECRETS["card_number"])
+
+# 4. Direct SQLite access + wrong key
+c = sqlite3.connect(path)
+blob = c.execute("SELECT card_number FROM records WHERE id=?", (rid,)).fetchone()[0]
+check("Stored value is binary ciphertext, not text", isinstance(blob, bytes) and b"4111" not in blob)
+check("Decryption with wrong key fails", raises(IntegrityError, lambda: decrypt(b"\x00" * 32, blob, b"card_number")))
+
+# 5. Randomised encryption
+db.insert(SECRETS)
+a, b = [r[0] for r in c.execute("SELECT email FROM records")][:2]
+check("Same plaintext -> different ciphertext (random nonce)", a != b)
+
+# 6. Tampering / integrity
+tampered = bytearray(blob); tampered[-1] ^= 1
+c.execute("UPDATE records SET card_number=? WHERE id=?", (bytes(tampered), rid)); c.commit()
+check("Tampered ciphertext detected (GCM tag)", raises(IntegrityError, lambda: db.get(rid)))
+
+# 7. Ciphertext swapping between columns
+rid2 = db.insert(SECRETS)
+email_blob = c.execute("SELECT email FROM records WHERE id=?", (rid2,)).fetchone()[0]
+c.execute("UPDATE records SET full_name=? WHERE id=?", (email_blob, rid2)); c.commit()
+check("Column-swap attack detected (AAD binding)", raises(IntegrityError, lambda: db.get(rid2)))
+
+# 8. SQL injection
+evil = dict(SECRETS, full_name="'; DROP TABLE records;--")
+eid = db.insert(evil)
+check("SQL injection payload stored harmlessly", db.get(eid)["full_name"] == evil["full_name"])
+check("Table survived injection attempt", c.execute("SELECT COUNT(*) FROM records").fetchone()[0] > 0)
+
+# 9. Brute-force lockout
+db2 = SecureDB(path)
+for _ in range(5): raises(AuthError, lambda: db2.login("guess"))
+check("Lockout after 5 failed attempts", raises(AuthError, lambda: db2.login("Correct-Horse-Battery")))
+
+c.close(); db.close(); db2.close(); shutil.rmtree(tmp)
+print(f"\n{sum(results)}/{len(results)} tests passed")
+
+
+
+
+4
+
+"""Performance evaluation: plaintext SQLite vs AES-256-GCM SecureDB."""
+import csv, os, random, sqlite3, string, time
+from secure_db import SecureDB, FIELDS
+
+SIZES = [100, 1000, 5000, 10000]
+
+
+def fake(n):
+    r = lambda k: "".join(random.choices(string.ascii_letters + string.digits, k=k))
+    return [{"full_name": r(12), "email": r(8) + "@mail.com", "phone": r(10),
+             "card_number": "".join(random.choices(string.digits, k=16)),
+             "notes": r(60)} for _ in range(n)]
+
+
+def plain_run(path, recs):
+    if os.path.exists(path): os.remove(path)
+    c = sqlite3.connect(path)
+    c.execute(f"CREATE TABLE records(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+              f"{','.join(f + ' TEXT' for f in FIELDS)})")
+    q = f"INSERT INTO records({','.join(FIELDS)}) VALUES({','.join('?'*len(FIELDS))})"
+    t = time.perf_counter(); c.executemany(q, [[r[f] for f in FIELDS] for r in recs]); c.commit()
+    ins = time.perf_counter() - t
+    t = time.perf_counter(); c.execute("SELECT * FROM records").fetchall()
+    rd = time.perf_counter() - t
+    t = time.perf_counter()
+    for i in random.sample(range(1, len(recs) + 1), min(100, len(recs))):
+        c.execute("SELECT * FROM records WHERE id=?", (i,)).fetchone()
+    one = (time.perf_counter() - t) / min(100, len(recs))
+    c.close()
+    return ins, rd, one, os.path.getsize(path)
+
+
+def secure_run(path, recs):
+    if os.path.exists(path): os.remove(path)
+    db = SecureDB(path)
+    t = time.perf_counter(); db.setup("benchmark-pass"); kdf = time.perf_counter() - t
+    t = time.perf_counter(); db.insert_many(recs); ins = time.perf_counter() - t
+    t = time.perf_counter(); db.list_all(); rd = time.perf_counter() - t
+    t = time.perf_counter()
+    for i in random.sample(range(1, len(recs) + 1), min(100, len(recs))):
+        db.get(i)
+    one = (time.perf_counter() - t) / min(100, len(recs))
+    db.close()
+    return ins, rd, one, os.path.getsize(path), kdf
+
+
+if __name__ == "__main__":
+    rows = []
+    print(f"{'N':>6} | {'ins plain':>9} {'ins AES':>9} | {'read plain':>10} {'read AES':>9} | "
+          f"{'size plain':>10} {'size AES':>9} {'overhead':>8} | {'1-rec AES(ms)':>13}")
+    for n in SIZES:
+        recs = fake(n)
+        p = plain_run("bench_plain.db", recs)
+        s = secure_run("bench_secure.db", recs)
+        ov = (s[3] / p[3] - 1) * 100
+        rows.append([n, *p, *s, ov])
+        print(f"{n:>6} | {p[0]:>9.4f} {s[0]:>9.4f} | {p[1]:>10.4f} {s[1]:>9.4f} | "
+              f"{p[3]:>10} {s[3]:>9} {ov:>7.1f}% | {s[2]*1000:>13.3f}")
+    print(f"\nOne-time login cost (scrypt KDF): {rows[-1][-2]*1000:.0f} ms")
+    with open("benchmark_results.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["n", "plain_insert_s", "plain_readall_s", "plain_get1_s", "plain_bytes",
+                    "aes_insert_s", "aes_readall_s", "aes_get1_s", "aes_bytes", "kdf_s", "size_overhead_pct"])
+        w.writerows(rows)
+    for f in ("bench_plain.db", "bench_secure.db"): os.remove(f)
+    try:
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        ns = [r[0] for r in rows]
+        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+        ax[0].plot(ns, [r[1] for r in rows], "o-", label="Plain insert")
+        ax[0].plot(ns, [r[5] for r in rows], "o-", label="AES insert")
+        ax[0].plot(ns, [r[2] for r in rows], "s--", label="Plain read-all")
+        ax[0].plot(ns, [r[6] for r in rows], "s--", label="AES read-all")
+        ax[0].set_xlabel("Records"); ax[0].set_ylabel("Seconds"); ax[0].legend(); ax[0].set_title("Execution time")
+        ax[1].bar([str(n) for n in ns], [r[-1] for r in rows]); ax[1].set_title("Storage overhead (%)")
+        plt.tight_layout(); plt.savefig("benchmark_chart.png", dpi=120)
+    except ImportError:
+        pass

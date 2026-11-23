@@ -1,0 +1,71 @@
+from math import gcd
+from typing import Tuple
+
+# Example prime field and curve parameters
+p = 97  # prime modulus
+a = 1
+b = 1   # curve: y^2 = x^3 + x + 1 over F_p
+Gx, Gy = 5, 36  # generator point G
+
+# Modular inverse using Fermat's little theorem
+def mod_inverse(x: int, mod: int) -> int:
+    return pow(x, mod - 2, mod)
+
+# Point validation
+def is_on_curve(pt: Tuple[int, int], a: int, b: int, p: int) -> bool:
+    if pt[1] is None:
+        return False
+    x, y = pt
+    return (y*y) % p == (x**3 + a*x + b) % p
+
+# Point addition
+def add_pt(P: Tuple[int, int], Q: Tuple[int, int], a: int, b: int, p: int) -> Tuple[int, int]:
+    if P[1] is None or Q[1] is None:
+        return P, Q
+    x1, y1 = P
+    x2, y2 = Q
+    if x1 == x2 and (y1 + y2) % p == 0:
+        return None, None  # point at infinity
+    if P == Q:
+        # doubling
+        m = (3*x1**2 + a) * mod_inverse(2*y1, p) % p
+    else:
+        m = (y2 - y1) * mod_inverse(x2 - x1, p) % p
+    x3 = (m**2 - x1 - x2) % p
+    y3 = (m*(x1 - x3) - y1) % p
+    return (x3, y3)
+
+# Point doubling (special case of addition)
+def double_pt(P: Tuple[int, int], a: int, b: int, p: int) -> Tuple[int, int]:
+    if P[1] is None:
+        return P
+    x1, y1 = P
+    if (3*x1**2 + a) % p == 0 or (2*y1) % p == 0:
+        return None, None
+    m = (3*x1**2 + a) * mod_inverse(2*y1, p) % p
+    x3 = (m**2 - 2*x1) % p
+    y3 = (m*(x1 - x3) - y1) % p
+    return (x3, y3)
+
+# Scalar multiplication (double-and-add)
+def scalar_mult(k: int, P: Tuple[int, int], a: int, b: int, p: int) -> Tuple[int, int]:
+    if k == 0 or P[1] is None:
+        return (0, 0)  # point at infinity
+    result = (0, 0)
+    addand = P
+    while k > 0:
+        if k & 1:
+            result, addand = add_pt(result, addand, a, b, p)
+        addand, addand = double_pt(addand, a, b, p)
+        k >>= 1
+    return result
+
+# Generate cyclic subgroup
+def generate_subgroup(base: Tuple[int, int], k: int, a: int, b: int, p: int) -> list:
+    pts = []
+    P = base
+    for i in range(k):
+        pts.append(P)
+        P, P = scalar_mult(1, P, a, b, p)
+    return pts
+
